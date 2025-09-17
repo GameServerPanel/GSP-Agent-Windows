@@ -3998,76 +3998,171 @@ sub shell_action
 	}
 	elsif($action eq 'get_cpu_usage')
 	{
-		my %prev_idle;
-		my %prev_total;
-		open(STAT, '/proc/stat');
-		while (<STAT>) {
-			next unless /^cpu([0-9]+)/;
-			my @stat = split /\s+/, $_;
-			$prev_idle{$1} = $stat[4];
-			$prev_total{$1} = $stat[1] + $stat[2] + $stat[3] + $stat[4];
-		}
-		close STAT;
-		sleep 1;
-		my %idle;
-		my %total;
-		open(STAT, '/proc/stat');
-		while (<STAT>) {
-			next unless /^cpu([0-9]+)/;
-			my @stat = split /\s+/, $_;
-			$idle{$1} = $stat[4];
-			$total{$1} = $stat[1] + $stat[2] + $stat[3] + $stat[4];
-		}
-		close STAT;
 		my %cpu_percent_usage;
-		foreach my $key ( keys %idle )
-		{
-			my $diff_idle = $idle{$key} - $prev_idle{$key};
-			my $diff_total = $total{$key} - $prev_total{$key};
-			my $percent = (100 * ($diff_total - $diff_idle)) / $diff_total;
-			$percent = sprintf "%.2f", $percent unless $percent == 0;
-			$cpu_percent_usage{$key} = encode_base64($percent);
+		
+		# Windows/Cygwin compatible CPU usage detection
+		if (-e '/proc/stat') {
+			# Linux method (for backward compatibility)
+			my %prev_idle;
+			my %prev_total;
+			open(STAT, '/proc/stat');
+			while (<STAT>) {
+				next unless /^cpu([0-9]+)/;
+				my @stat = split /\s+/, $_;
+				$prev_idle{$1} = $stat[4];
+				$prev_total{$1} = $stat[1] + $stat[2] + $stat[3] + $stat[4];
+			}
+			close STAT;
+			sleep 1;
+			my %idle;
+			my %total;
+			open(STAT, '/proc/stat');
+			while (<STAT>) {
+				next unless /^cpu([0-9]+)/;
+				my @stat = split /\s+/, $_;
+				$idle{$1} = $stat[4];
+				$total{$1} = $stat[1] + $stat[2] + $stat[3] + $stat[4];
+			}
+			close STAT;
+			foreach my $key ( keys %idle )
+			{
+				my $diff_idle = $idle{$key} - $prev_idle{$key};
+				my $diff_total = $total{$key} - $prev_total{$key};
+				my $percent = (100 * ($diff_total - $diff_idle)) / $diff_total;
+				$percent = sprintf "%.2f", $percent unless $percent == 0;
+				$cpu_percent_usage{$key} = encode_base64($percent);
+			}
+		} else {
+			# Windows method using wmic
+			my $cpu_output = `wmic cpu get loadpercentage /value 2>/dev/null`;
+			if ($cpu_output && $cpu_output =~ /LoadPercentage=(\d+)/i) {
+				my $percent = $1;
+				$cpu_percent_usage{'0'} = encode_base64($percent);
+			} else {
+				# Fallback method
+				$cpu_percent_usage{'0'} = encode_base64('0');
+			}
 		}
 		return {%cpu_percent_usage};
 	}
 	elsif($action eq 'get_ram_usage')
 	{
-		my($total, $buffers, $cached, $free) = qw(0 0 0 0);
-		open(STAT, '/proc/meminfo');
-		while (<STAT>) {
-			$total   += $1 if /MemTotal\:\s+(\d+) kB/;
-			$buffers += $1 if /Buffers\:\s+(\d+) kB/;
-			$cached  += $1 if /Cached\:\s+(\d+) kB/;
-			$free    += $1 if /MemFree\:\s+(\d+) kB/;
-		}
-		close STAT;
-		my $used = $total - $free - $cached - $buffers;
-		my $percent = 100 * $used / $total;
 		my %mem_usage;
-		$mem_usage{'used'}    = encode_base64($used * 1024);
-		$mem_usage{'total'}   = encode_base64($total * 1024);
-		$mem_usage{'percent'} = encode_base64($percent);
+		
+		# Windows/Cygwin compatible memory usage detection
+		if (-e '/proc/meminfo') {
+			# Linux method (for backward compatibility)
+			my($total, $buffers, $cached, $free) = qw(0 0 0 0);
+			open(STAT, '/proc/meminfo');
+			while (<STAT>) {
+				$total   += $1 if /MemTotal\:\s+(\d+) kB/;
+				$buffers += $1 if /Buffers\:\s+(\d+) kB/;
+				$cached  += $1 if /Cached\:\s+(\d+) kB/;
+				$free    += $1 if /MemFree\:\s+(\d+) kB/;
+			}
+			close STAT;
+			my $used = $total - $free - $cached - $buffers;
+			my $percent = 100 * $used / $total;
+			$mem_usage{'used'}    = encode_base64($used * 1024);
+			$mem_usage{'total'}   = encode_base64($total * 1024);
+			$mem_usage{'percent'} = encode_base64($percent);
+		} else {
+			# Windows method using wmic
+			my $mem_output = `wmic OS get TotalVisibleMemorySize,FreePhysicalMemory /value 2>/dev/null`;
+			if ($mem_output) {
+				my ($total_kb, $free_kb) = (0, 0);
+				if ($mem_output =~ /TotalVisibleMemorySize=(\d+)/i) { $total_kb = $1; }
+				if ($mem_output =~ /FreePhysicalMemory=(\d+)/i) { $free_kb = $1; }
+				
+				my $total_bytes = $total_kb * 1024;
+				my $used_bytes = ($total_kb - $free_kb) * 1024;
+				my $percent = $total_kb > 0 ? (($total_kb - $free_kb) / $total_kb) * 100 : 0;
+				
+				$mem_usage{'used'}    = encode_base64($used_bytes);
+				$mem_usage{'total'}   = encode_base64($total_bytes);
+				$mem_usage{'percent'} = encode_base64($percent);
+			} else {
+				# Fallback
+				$mem_usage{'used'}    = encode_base64('0');
+				$mem_usage{'total'}   = encode_base64('0');
+				$mem_usage{'percent'} = encode_base64('0');
+			}
+		}
 		return {%mem_usage};
 	}
 	elsif($action eq 'get_disk_usage')
 	{
-		my($total, $used, $free) = split(' ', `df -lP 2>/dev/null|grep "^.:\\s"|awk '{total+=\$2}{used+=\$3}{free+=\$4} END {print total, used, free}'`);
-		my $percent = 100 * $used / $total;
 		my %disk_usage;
-		$disk_usage{'free'}    = encode_base64($free * 1024);
-		$disk_usage{'used'}    = encode_base64($used * 1024);
-		$disk_usage{'total'}   = encode_base64($total * 1024);
-		$disk_usage{'percent'} = encode_base64($percent);
+		
+		# Windows/Cygwin compatible disk usage detection
+		if (-e '/bin/df') {
+			# Linux/Cygwin method
+			my($total, $used, $free) = split(' ', `df -lP 2>/dev/null|grep "^.:\\s"|awk '{total+=\$2}{used+=\$3}{free+=\$4} END {print total, used, free}'`);
+			if ($total && $used && $free) {
+				my $percent = 100 * $used / $total;
+				$disk_usage{'free'}    = encode_base64($free * 1024);
+				$disk_usage{'used'}    = encode_base64($used * 1024);
+				$disk_usage{'total'}   = encode_base64($total * 1024);
+				$disk_usage{'percent'} = encode_base64($percent);
+			}
+		} else {
+			# Windows method using wmic
+			my $disk_output = `wmic logicaldisk where "DeviceID='C:'" get Size,FreeSpace /value 2>/dev/null`;
+			if ($disk_output) {
+				my ($size, $free) = (0, 0);
+				if ($disk_output =~ /Size=(\d+)/i) { $size = $1; }
+				if ($disk_output =~ /FreeSpace=(\d+)/i) { $free = $1; }
+				
+				my $used = $size - $free;
+				my $percent = $size > 0 ? ($used / $size) * 100 : 0;
+				
+				$disk_usage{'free'}    = encode_base64($free);
+				$disk_usage{'used'}    = encode_base64($used);
+				$disk_usage{'total'}   = encode_base64($size);
+				$disk_usage{'percent'} = encode_base64($percent);
+			}
+		}
+		
+		# Fallback if no data obtained
+		if (!%disk_usage) {
+			$disk_usage{'free'}    = encode_base64('0');
+			$disk_usage{'used'}    = encode_base64('0');
+			$disk_usage{'total'}   = encode_base64('0');
+			$disk_usage{'percent'} = encode_base64('0');
+		}
+		
 		return {%disk_usage};
 	}
 	elsif($action eq 'get_uptime')
 	{
-		open(STAT, '/proc/uptime');
 		my $uptime = 0;
-		while (<STAT>) {
-			$uptime += $1 if /^([0-9]+)/;
+		
+		# Windows/Cygwin compatible uptime detection
+		if (-e '/proc/uptime') {
+			# Linux method
+			open(STAT, '/proc/uptime');
+			while (<STAT>) {
+				$uptime += $1 if /^([0-9]+)/;
+			}
+			close STAT;
+		} else {
+			# Windows method using wmic
+			my $boot_output = `wmic os get lastbootuptime /value 2>/dev/null`;
+			if ($boot_output && $boot_output =~ /LastBootUpTime=(\d{14})/i) {
+				my $boot_time_str = $1;
+				# Parse Windows time format (YYYYMMDDHHMMSS)
+				if ($boot_time_str =~ /^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})/) {
+					require Time::Local;
+					my $boot_timestamp = eval {
+						Time::Local::timelocal($6, $5, $4, $3, $2-1, $1-1900);
+					};
+					if (!$@ && $boot_timestamp) {
+						$uptime = time() - $boot_timestamp;
+					}
+				}
+			}
 		}
-		close STAT;
+		
 		my %upsince;
 		$upsince{'0'} = encode_base64($uptime);
 		$upsince{'1'} = encode_base64(time - $uptime);
