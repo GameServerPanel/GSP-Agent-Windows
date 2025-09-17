@@ -34,7 +34,7 @@ set "FTP_PASV_FIRST=50000"
 set "FTP_PASV_LAST=50100"
 
 :: Package list (add/remove as needed)
-set "PKGS=bash,coreutils,ca-certificates,curl,wget,tar,unzip,zip,gzip,bzip2,dos2unix,nano,git,subversion,rsync,screen,procps-ng,perl,perl-HTTP-Daemon,perl-Path-Class,perl-XML-Parser,perl-Archive-Zip,perl-XML-Simple,perl-Archive-Extract,openssh,cygrunsrv,pure-ftpd,openssl,httpd"
+set "PKGS=bash,coreutils,ca-certificates,curl,wget,tar,unzip,zip,gzip,bzip2,dos2unix,nano,git,subversion,rsync,screen,procps-ng,perl,perl-HTTP-Daemon,perl-Path-Class,perl-XML-Parser,perl-Archive-Zip,perl-XML-Simple,perl-Archive-Extract,perl-DBI,libmariadb3,openssh,cygrunsrv,pure-ftpd,openssl,httpd"
 
 :: GSP Agent release ZIP
 set "GSP_URL=https://github.com/GameServerPanel/GSP-Agent-Windows/releases/download/stable_release/GSP_Stable.zip"
@@ -136,6 +136,19 @@ powershell -NoP -NonI -Command ^
   "Expand-Archive -LiteralPath '%GSP_ZIP%' -DestinationPath '%GSP_TMP%' -Force"
 
 xcopy /E /I /Y "%GSP_TMP%\*" "%WD%\" >nul
+
+:: Copy resource monitoring files to their proper locations
+if exist "%~dp0Cfg\Config.pm" (
+    echo [+] Installing resource monitoring configuration...
+    if not exist "%WD%\OGP\Cfg" mkdir "%WD%\OGP\Cfg" >nul 2>&1
+    copy /Y "%~dp0Cfg\Config.pm" "%WD%\OGP\Cfg\Config.pm" >nul
+)
+
+if exist "%~dp0DB" (
+    echo [+] Installing database schema files...
+    if not exist "%WD%\OGP\DB" mkdir "%WD%\OGP\DB" >nul 2>&1
+    xcopy /E /I /Y "%~dp0DB\*" "%WD%\OGP\DB\" >nul
+)
 
 :: Cleanup bundle
 del /q "%GSP_ZIP%" >nul 2>&1

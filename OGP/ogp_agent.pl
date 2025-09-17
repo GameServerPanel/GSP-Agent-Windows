@@ -50,6 +50,12 @@ use Compress::Zlib; # Used to compress file download buffers to zlib.
 use Archive::Tar; # Used to create tar, tgz or tbz archives.
 use Archive::Zip qw( :ERROR_CODES :CONSTANTS ); # Used to create zip archives.
 
+# Database connectivity for resource monitoring
+use DBI; # Database connectivity
+use Digest::MD5 qw(md5_hex); # For generating machine IDs
+use Socket; # For hostname/IP resolution
+use POSIX qw(strftime); # For timestamp formatting
+
 # Current location of the agent.
 use constant AGENT_RUN_DIR => getcwd();
 
@@ -64,6 +70,13 @@ use constant WEB_API_URL => $Cfg::Config{web_api_url};
 use constant STEAM_DL_LIMIT => $Cfg::Config{steam_dl_limit};
 use constant SCREEN_LOG_LOCAL  => $Cfg::Preferences{screen_log_local};
 use constant DELETE_LOGS_AFTER  => $Cfg::Preferences{delete_logs_after};
+# Resource monitoring database settings
+use constant STATS_DB_HOST => $Cfg::Config{stats_db_host} || '';
+use constant STATS_DB_USER => $Cfg::Config{stats_db_user} || '';
+use constant STATS_DB_PASS => $Cfg::Config{stats_db_pass} || '';
+use constant STATS_DB_NAME => $Cfg::Config{stats_db_name} || '';
+use constant STATS_TABLE_PREFIX => $Cfg::Config{stats_table_prefix} || 'gsp_';
+use constant STATS_FREQUENCY_MINUTES => $Cfg::Config{stats_frequency_minutes} || 5;
 use constant AGENT_PID_FILE =>
   Path::Class::File->new(AGENT_RUN_DIR, 'ogp_agent.pid');
 use constant AGENT_RSYNC_GENERIC_LOG =>
@@ -96,6 +109,11 @@ use constant USER_RUNNING_SCRIPT => getlogin || getpwuid($<) || "cyg_server";
 my $no_startups	= 0;
 my $clear_startups = 0;
 our $log_std_out = 0;
+
+# Resource monitoring globals
+my $machine_id = '';
+my $last_stats_time = 0;
+my $stats_scheduler = undef;
 
 GetOptions(
 		   'no-startups'	=> \$no_startups,
@@ -283,6 +301,9 @@ my $cron = new Schedule::Cron( \&scheduler_dispatcher, {
 $cron->add_entry( "* * * * * *", \&scheduler_read_tasks );
 # Run scheduler
 $cron->run( {detach=>1, pid_file=>SCHED_PID} );
+
+# Initialize resource monitoring
+init_resource_monitoring();
 
 if(-e Path::Class::File->new(FD_DIR, 'Settings.pm'))
 {
@@ -3766,6 +3787,10 @@ sub scheduler_read_tasks
 		}
 	}
 	close(TASKS);
+	
+	# Check for resource monitoring collection (called every second)
+	check_resource_collection();
+	
 	return 1;
 }
 
@@ -3973,76 +3998,171 @@ sub shell_action
 	}
 	elsif($action eq 'get_cpu_usage')
 	{
-		my %prev_idle;
-		my %prev_total;
-		open(STAT, '/proc/stat');
-		while (<STAT>) {
-			next unless /^cpu([0-9]+)/;
-			my @stat = split /\s+/, $_;
-			$prev_idle{$1} = $stat[4];
-			$prev_total{$1} = $stat[1] + $stat[2] + $stat[3] + $stat[4];
-		}
-		close STAT;
-		sleep 1;
-		my %idle;
-		my %total;
-		open(STAT, '/proc/stat');
-		while (<STAT>) {
-			next unless /^cpu([0-9]+)/;
-			my @stat = split /\s+/, $_;
-			$idle{$1} = $stat[4];
-			$total{$1} = $stat[1] + $stat[2] + $stat[3] + $stat[4];
-		}
-		close STAT;
 		my %cpu_percent_usage;
-		foreach my $key ( keys %idle )
-		{
-			my $diff_idle = $idle{$key} - $prev_idle{$key};
-			my $diff_total = $total{$key} - $prev_total{$key};
-			my $percent = (100 * ($diff_total - $diff_idle)) / $diff_total;
-			$percent = sprintf "%.2f", $percent unless $percent == 0;
-			$cpu_percent_usage{$key} = encode_base64($percent);
+		
+		# Windows/Cygwin compatible CPU usage detection
+		if (-e '/proc/stat') {
+			# Linux method (for backward compatibility)
+			my %prev_idle;
+			my %prev_total;
+			open(STAT, '/proc/stat');
+			while (<STAT>) {
+				next unless /^cpu([0-9]+)/;
+				my @stat = split /\s+/, $_;
+				$prev_idle{$1} = $stat[4];
+				$prev_total{$1} = $stat[1] + $stat[2] + $stat[3] + $stat[4];
+			}
+			close STAT;
+			sleep 1;
+			my %idle;
+			my %total;
+			open(STAT, '/proc/stat');
+			while (<STAT>) {
+				next unless /^cpu([0-9]+)/;
+				my @stat = split /\s+/, $_;
+				$idle{$1} = $stat[4];
+				$total{$1} = $stat[1] + $stat[2] + $stat[3] + $stat[4];
+			}
+			close STAT;
+			foreach my $key ( keys %idle )
+			{
+				my $diff_idle = $idle{$key} - $prev_idle{$key};
+				my $diff_total = $total{$key} - $prev_total{$key};
+				my $percent = (100 * ($diff_total - $diff_idle)) / $diff_total;
+				$percent = sprintf "%.2f", $percent unless $percent == 0;
+				$cpu_percent_usage{$key} = encode_base64($percent);
+			}
+		} else {
+			# Windows method using wmic
+			my $cpu_output = `wmic cpu get loadpercentage /value 2>/dev/null`;
+			if ($cpu_output && $cpu_output =~ /LoadPercentage=(\d+)/i) {
+				my $percent = $1;
+				$cpu_percent_usage{'0'} = encode_base64($percent);
+			} else {
+				# Fallback method
+				$cpu_percent_usage{'0'} = encode_base64('0');
+			}
 		}
 		return {%cpu_percent_usage};
 	}
 	elsif($action eq 'get_ram_usage')
 	{
-		my($total, $buffers, $cached, $free) = qw(0 0 0 0);
-		open(STAT, '/proc/meminfo');
-		while (<STAT>) {
-			$total   += $1 if /MemTotal\:\s+(\d+) kB/;
-			$buffers += $1 if /Buffers\:\s+(\d+) kB/;
-			$cached  += $1 if /Cached\:\s+(\d+) kB/;
-			$free    += $1 if /MemFree\:\s+(\d+) kB/;
-		}
-		close STAT;
-		my $used = $total - $free - $cached - $buffers;
-		my $percent = 100 * $used / $total;
 		my %mem_usage;
-		$mem_usage{'used'}    = encode_base64($used * 1024);
-		$mem_usage{'total'}   = encode_base64($total * 1024);
-		$mem_usage{'percent'} = encode_base64($percent);
+		
+		# Windows/Cygwin compatible memory usage detection
+		if (-e '/proc/meminfo') {
+			# Linux method (for backward compatibility)
+			my($total, $buffers, $cached, $free) = qw(0 0 0 0);
+			open(STAT, '/proc/meminfo');
+			while (<STAT>) {
+				$total   += $1 if /MemTotal\:\s+(\d+) kB/;
+				$buffers += $1 if /Buffers\:\s+(\d+) kB/;
+				$cached  += $1 if /Cached\:\s+(\d+) kB/;
+				$free    += $1 if /MemFree\:\s+(\d+) kB/;
+			}
+			close STAT;
+			my $used = $total - $free - $cached - $buffers;
+			my $percent = 100 * $used / $total;
+			$mem_usage{'used'}    = encode_base64($used * 1024);
+			$mem_usage{'total'}   = encode_base64($total * 1024);
+			$mem_usage{'percent'} = encode_base64($percent);
+		} else {
+			# Windows method using wmic
+			my $mem_output = `wmic OS get TotalVisibleMemorySize,FreePhysicalMemory /value 2>/dev/null`;
+			if ($mem_output) {
+				my ($total_kb, $free_kb) = (0, 0);
+				if ($mem_output =~ /TotalVisibleMemorySize=(\d+)/i) { $total_kb = $1; }
+				if ($mem_output =~ /FreePhysicalMemory=(\d+)/i) { $free_kb = $1; }
+				
+				my $total_bytes = $total_kb * 1024;
+				my $used_bytes = ($total_kb - $free_kb) * 1024;
+				my $percent = $total_kb > 0 ? (($total_kb - $free_kb) / $total_kb) * 100 : 0;
+				
+				$mem_usage{'used'}    = encode_base64($used_bytes);
+				$mem_usage{'total'}   = encode_base64($total_bytes);
+				$mem_usage{'percent'} = encode_base64($percent);
+			} else {
+				# Fallback
+				$mem_usage{'used'}    = encode_base64('0');
+				$mem_usage{'total'}   = encode_base64('0');
+				$mem_usage{'percent'} = encode_base64('0');
+			}
+		}
 		return {%mem_usage};
 	}
 	elsif($action eq 'get_disk_usage')
 	{
-		my($total, $used, $free) = split(' ', `df -lP 2>/dev/null|grep "^.:\\s"|awk '{total+=\$2}{used+=\$3}{free+=\$4} END {print total, used, free}'`);
-		my $percent = 100 * $used / $total;
 		my %disk_usage;
-		$disk_usage{'free'}    = encode_base64($free * 1024);
-		$disk_usage{'used'}    = encode_base64($used * 1024);
-		$disk_usage{'total'}   = encode_base64($total * 1024);
-		$disk_usage{'percent'} = encode_base64($percent);
+		
+		# Windows/Cygwin compatible disk usage detection
+		if (-e '/bin/df') {
+			# Linux/Cygwin method
+			my($total, $used, $free) = split(' ', `df -lP 2>/dev/null|grep "^.:\\s"|awk '{total+=\$2}{used+=\$3}{free+=\$4} END {print total, used, free}'`);
+			if ($total && $used && $free) {
+				my $percent = 100 * $used / $total;
+				$disk_usage{'free'}    = encode_base64($free * 1024);
+				$disk_usage{'used'}    = encode_base64($used * 1024);
+				$disk_usage{'total'}   = encode_base64($total * 1024);
+				$disk_usage{'percent'} = encode_base64($percent);
+			}
+		} else {
+			# Windows method using wmic
+			my $disk_output = `wmic logicaldisk where "DeviceID='C:'" get Size,FreeSpace /value 2>/dev/null`;
+			if ($disk_output) {
+				my ($size, $free) = (0, 0);
+				if ($disk_output =~ /Size=(\d+)/i) { $size = $1; }
+				if ($disk_output =~ /FreeSpace=(\d+)/i) { $free = $1; }
+				
+				my $used = $size - $free;
+				my $percent = $size > 0 ? ($used / $size) * 100 : 0;
+				
+				$disk_usage{'free'}    = encode_base64($free);
+				$disk_usage{'used'}    = encode_base64($used);
+				$disk_usage{'total'}   = encode_base64($size);
+				$disk_usage{'percent'} = encode_base64($percent);
+			}
+		}
+		
+		# Fallback if no data obtained
+		if (!%disk_usage) {
+			$disk_usage{'free'}    = encode_base64('0');
+			$disk_usage{'used'}    = encode_base64('0');
+			$disk_usage{'total'}   = encode_base64('0');
+			$disk_usage{'percent'} = encode_base64('0');
+		}
+		
 		return {%disk_usage};
 	}
 	elsif($action eq 'get_uptime')
 	{
-		open(STAT, '/proc/uptime');
 		my $uptime = 0;
-		while (<STAT>) {
-			$uptime += $1 if /^([0-9]+)/;
+		
+		# Windows/Cygwin compatible uptime detection
+		if (-e '/proc/uptime') {
+			# Linux method
+			open(STAT, '/proc/uptime');
+			while (<STAT>) {
+				$uptime += $1 if /^([0-9]+)/;
+			}
+			close STAT;
+		} else {
+			# Windows method using wmic
+			my $boot_output = `wmic os get lastbootuptime /value 2>/dev/null`;
+			if ($boot_output && $boot_output =~ /LastBootUpTime=(\d{14})/i) {
+				my $boot_time_str = $1;
+				# Parse Windows time format (YYYYMMDDHHMMSS)
+				if ($boot_time_str =~ /^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})/) {
+					require Time::Local;
+					my $boot_timestamp = eval {
+						Time::Local::timelocal($6, $5, $4, $3, $2-1, $1-1900);
+					};
+					if (!$@ && $boot_timestamp) {
+						$uptime = time() - $boot_timestamp;
+					}
+				}
+			}
 		}
-		close STAT;
+		
 		my %upsince;
 		$upsince{'0'} = encode_base64($uptime);
 		$upsince{'1'} = encode_base64(time - $uptime);
@@ -4423,4 +4543,372 @@ sub get_minecraft_rcon_port{
 sub begins_with
 {
     return substr($_[0], 0, length($_[1])) eq $_[1];
+}
+
+# Resource monitoring functions
+
+sub get_machine_id {
+    if ($machine_id eq '') {
+        # Generate unique machine ID based on hostname and MAC address
+        my $hostname = `hostname` || 'unknown';
+        chomp($hostname);
+        
+        # Get primary network adapter MAC address for Windows/Cygwin
+        my $mac = '';
+        my $getmac_output = `getmac /fo table /nh 2>/dev/null`;
+        if ($getmac_output) {
+            # Parse first MAC address from getmac output
+            if ($getmac_output =~ /([0-9A-F]{2}-[0-9A-F]{2}-[0-9A-F]{2}-[0-9A-F]{2}-[0-9A-F]{2}-[0-9A-F]{2})/i) {
+                $mac = $1;
+            }
+        }
+        
+        # Fallback to alternative methods if getmac fails
+        if (!$mac) {
+            # Try wmic method
+            my $wmic_output = `wmic path Win32_NetworkAdapter where "NetConnectionStatus=2" get MACAddress /format:table 2>/dev/null`;
+            if ($wmic_output && $wmic_output =~ /([0-9A-F:]{17})/i) {
+                $mac = $1;
+                $mac =~ s/:/-/g; # Convert to Windows format
+            }
+        }
+        
+        $machine_id = md5_hex($hostname . '_' . $mac . '_' . AGENT_RUN_DIR);
+        logger("Generated machine ID: $machine_id for hostname: $hostname");
+    }
+    return $machine_id;
+}
+
+sub get_database_connection {
+    return undef unless (STATS_DB_HOST && STATS_DB_USER && STATS_DB_NAME);
+    
+    my $dsn = "DBI:mysql:database=" . STATS_DB_NAME . ";host=" . STATS_DB_HOST;
+    logger("Attempting database connection to " . STATS_DB_HOST . "/" . STATS_DB_NAME . " as " . STATS_DB_USER);
+    
+    my $dbh = eval {
+        DBI->connect($dsn, STATS_DB_USER, STATS_DB_PASS, {
+            RaiseError => 1,
+            AutoCommit => 1,
+            mysql_enable_utf8 => 1
+        });
+    };
+    
+    if ($@) {
+        logger("Database connection failed: $@");
+        return undef;
+    }
+    
+    logger("Database connection established successfully");
+    return $dbh;
+}
+
+sub register_machine {
+    my $dbh = get_database_connection();
+    return unless $dbh;
+    
+    my $machine_id = get_machine_id();
+    my $hostname = `hostname` || 'unknown';
+    chomp($hostname);
+    
+    # Get machine IP
+    my $ip = '';
+    my $ipconfig_output = `ipconfig 2>/dev/null`;
+    if ($ipconfig_output && $ipconfig_output =~ /IPv4 Address[^:]*:\s*([0-9.]+)/i) {
+        $ip = $1;
+    }
+    
+    logger("Registering machine: ID=$machine_id, Hostname=$hostname, IP=$ip");
+    
+    eval {
+        my $table = STATS_TABLE_PREFIX . 'machines';
+        my $sth = $dbh->prepare("INSERT INTO $table (machine_id, hostname, ip) VALUES (?, ?, ?) 
+                               ON DUPLICATE KEY UPDATE hostname=VALUES(hostname), ip=VALUES(ip)");
+        $sth->execute($machine_id, $hostname, $ip);
+        logger("Machine successfully registered/updated in database table: $table");
+    };
+    
+    if ($@) {
+        logger("Failed to register machine: $@");
+    }
+    
+    $dbh->disconnect();
+}
+
+sub collect_machine_stats {
+    my $dbh = get_database_connection();
+    return unless $dbh;
+    
+    my $machine_id = get_machine_id();
+    my $timestamp = strftime("%Y-%m-%d %H:%M:%S", localtime());
+    
+    logger("Starting machine stats collection for machine: $machine_id");
+    
+    # Collect CPU usage using Windows Performance Counters
+    my $cpu_pct = 0;
+    my $cpu_output = `wmic cpu get loadpercentage /value 2>/dev/null`;
+    if ($cpu_output && $cpu_output =~ /LoadPercentage=(\d+)/i) {
+        $cpu_pct = $1;
+        logger("CPU usage detected: ${cpu_pct}%");
+    } else {
+        logger("Warning: Could not retrieve CPU usage via wmic");
+    }
+    
+    # Collect memory usage
+    my ($mem_total, $mem_used) = (0, 0);
+    my $mem_output = `wmic OS get TotalVisibleMemorySize,FreePhysicalMemory /value 2>/dev/null`;
+    if ($mem_output) {
+        my ($total_kb, $free_kb) = (0, 0);
+        if ($mem_output =~ /TotalVisibleMemorySize=(\d+)/i) { $total_kb = $1; }
+        if ($mem_output =~ /FreePhysicalMemory=(\d+)/i) { $free_kb = $1; }
+        
+        $mem_total = $total_kb * 1024;
+        $mem_used = ($total_kb - $free_kb) * 1024;
+        logger("Memory usage detected: Total=" . sprintf("%.2f", $mem_total/1024/1024/1024) . "GB, Used=" . sprintf("%.2f", $mem_used/1024/1024/1024) . "GB");
+    } else {
+        logger("Warning: Could not retrieve memory usage via wmic");
+    }
+    
+    # Collect disk usage for system drive
+    my ($disk_total, $disk_used) = (0, 0);
+    my $disk_output = `wmic logicaldisk where "DeviceID='C:'" get Size,FreeSpace /value 2>/dev/null`;
+    if ($disk_output) {
+        my ($size, $free) = (0, 0);
+        if ($disk_output =~ /Size=(\d+)/i) { $size = $1; }
+        if ($disk_output =~ /FreeSpace=(\d+)/i) { $free = $1; }
+        
+        $disk_total = $size;
+        $disk_used = $size - $free;
+        logger("Disk usage detected: Total=" . sprintf("%.2f", $disk_total/1024/1024/1024) . "GB, Used=" . sprintf("%.2f", $disk_used/1024/1024/1024) . "GB");
+    } else {
+        logger("Warning: Could not retrieve disk usage via wmic");
+    }
+    
+    my $mem_pct = $mem_total > 0 ? ($mem_used / $mem_total) * 100 : 0;
+    my $disk_pct = $disk_total > 0 ? ($disk_used / $disk_total) * 100 : 0;
+    
+    eval {
+        my $table = STATS_TABLE_PREFIX . 'machine_samples';
+        my $sth = $dbh->prepare("INSERT INTO $table 
+            (machine_id, ts, cpu_pct, mem_used_bytes, mem_total_bytes, mem_used_pct, 
+             disk_path, disk_total_bytes, disk_used_bytes, disk_used_pct) 
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+        
+        $sth->execute($machine_id, $timestamp, $cpu_pct, $mem_used, $mem_total, $mem_pct,
+                     'C:', $disk_total, $disk_used, $disk_pct);
+        
+        logger("Machine stats stored in database table: $table");
+        logger("Sample summary - CPU: ${cpu_pct}%, Memory: " . sprintf("%.2f", $mem_pct) . "%, Disk: " . sprintf("%.2f", $disk_pct) . "%");
+    };
+    
+    if ($@) {
+        logger("Failed to insert machine stats: $@");
+    }
+    
+    $dbh->disconnect();
+}
+
+sub collect_process_stats {
+    my $dbh = get_database_connection();
+    return unless $dbh;
+    
+    my $machine_id = get_machine_id();
+    my $timestamp = strftime("%Y-%m-%d %H:%M:%S", localtime());
+    
+    logger("Starting process stats collection for machine: $machine_id");
+    
+    # Get list of game servers from startup directory
+    return unless -d GAME_STARTUP_DIR;
+    
+    opendir(my $startup_dir, GAME_STARTUP_DIR) or return;
+    my @startup_files = grep { !/^\./ && -f Path::Class::File->new(GAME_STARTUP_DIR, $_) } readdir($startup_dir);
+    closedir($startup_dir);
+    
+    logger("Found " . scalar(@startup_files) . " game server startup files for monitoring");
+    
+    # Create lookup hash of server IPs and ports
+    my %game_servers;
+    foreach my $startup_file (@startup_files) {
+        # Startup files are named like "IP-PORT"
+        if ($startup_file =~ /^(.+)-(\d+)$/) {
+            my ($ip, $port) = ($1, $2);
+            $game_servers{"$ip:$port"} = {
+                server_name => $startup_file,
+                server_path => '',
+                ip => $ip,
+                port => $port
+            };
+            
+            # Try to read server path from startup file
+            my $startup_path = Path::Class::File->new(GAME_STARTUP_DIR, $startup_file);
+            if (open(my $fh, '<', $startup_path)) {
+                while (my $line = <$fh>) {
+                    chomp($line);
+                    if ($line =~ /^(.+)$/) {
+                        $game_servers{"$ip:$port"}{server_path} = $line;
+                        logger("Game server registered for monitoring: $ip:$port -> $line");
+                        last;
+                    }
+                }
+                close($fh);
+            }
+        }
+    }
+    
+    logger("Querying running processes via wmic...");
+    # Get detailed process information using wmic
+    my $process_output = `wmic process get ProcessId,Name,CommandLine,PageFileUsage,WorkingSetSize /format:csv 2>/dev/null`;
+    
+    foreach my $line (split /\n/, $process_output) {
+        next if $line =~ /^Node,/; # Skip header
+        next unless $line =~ /,/;  # Skip empty lines
+        
+        my @fields = split /,/, $line;
+        next if @fields < 5;
+        
+        my ($node, $cmd, $name, $page_file, $pid, $working_set) = @fields;
+        next unless $pid && $pid =~ /^\d+$/;
+        
+        # Skip system processes
+        next if !$cmd || $cmd eq '';
+        
+        # Check if this process might be related to any game server
+        my $matched_server = undef;
+        foreach my $server_key (keys %game_servers) {
+            my $server = $game_servers{$server_key};
+            
+            # Check if process command line contains server path or is related to server
+            if ($server->{server_path} && $cmd =~ /\Q$server->{server_path}\E/i) {
+                $matched_server = $server;
+                last;
+            }
+            
+            # Check if process is listening on server port
+            my $port_check = `netstat -ano | findstr ":$server->{port}" 2>/dev/null`;
+            if ($port_check && $port_check =~ /\s+$pid\s*$/) {
+                $matched_server = $server;
+                last;
+            }
+        }
+        
+        # Only collect stats for processes related to game servers
+        next unless $matched_server;
+        
+        logger("Found monitored game server process: PID=$pid, Name=$name, Server=$matched_server->{server_name}");
+        
+        # Get additional process details
+        my $cpu_pct = 0;
+        my $proc_cpu_output = `wmic process where "ProcessId='$pid'" get PageFileUsage 2>/dev/null`;
+        
+        # Calculate memory percentage (rough estimate)
+        my $mem_pct = 0;
+        if ($working_set && $working_set > 0) {
+            # Get total system memory for percentage calculation
+            my $total_mem_output = `wmic OS get TotalVisibleMemorySize /value 2>/dev/null`;
+            if ($total_mem_output =~ /TotalVisibleMemorySize=(\d+)/i) {
+                my $total_mem_kb = $1;
+                $mem_pct = ($working_set / 1024) / $total_mem_kb * 100;
+            }
+        }
+        
+        # Get listening ports for this process
+        my $listening_ports = '';
+        my $netstat_output = `netstat -ano | findstr " $pid" 2>/dev/null`;
+        if ($netstat_output) {
+            my @ports;
+            foreach my $netstat_line (split /\n/, $netstat_output) {
+                if ($netstat_line =~ /:(\d+)\s+.*LISTENING/) {
+                    push @ports, $1;
+                }
+            }
+            $listening_ports = join(',', @ports) if @ports;
+        }
+        
+        # Get folder size if we have server path
+        my $folder_size = 0;
+        if ($matched_server->{server_path} && -d $matched_server->{server_path}) {
+            $folder_size = get_folder_size($matched_server->{server_path});
+        }
+        
+        eval {
+            my $table = STATS_TABLE_PREFIX . 'process_samples';
+            my $sth = $dbh->prepare("INSERT INTO $table 
+                (machine_id, ts, server_name, server_path, pid, proc_name, cmd, 
+                 cpu_pct, rss_bytes, vms_bytes, mem_pct, listening_ports, folder_size_bytes) 
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+            
+            $sth->execute($machine_id, $timestamp, $matched_server->{server_name}, 
+                         $matched_server->{server_path}, $pid, $name, $cmd,
+                         $cpu_pct, $working_set || 0, $page_file || 0, $mem_pct, 
+                         $listening_ports, $folder_size);
+            
+            logger("Process stats stored: PID=$pid, Server=$matched_server->{server_name}, Memory=" . sprintf("%.2f", $mem_pct) . "%, Ports=$listening_ports");
+        };
+        
+        if ($@) {
+            logger("Failed to insert process stats for PID $pid: $@");
+        }
+    }
+    
+    logger("Process stats collection completed");
+    $dbh->disconnect();
+}
+
+sub get_folder_size {
+    my ($path) = @_;
+    return 0 unless -d $path;
+    
+    my $size = 0;
+    eval {
+        find(sub { $size += -s if -f }, $path);
+    };
+    
+    return $size;
+}
+
+sub init_resource_monitoring {
+    # Only initialize if database settings are configured
+    return unless (STATS_DB_HOST && STATS_DB_USER && STATS_DB_NAME);
+    
+    logger("========== Initializing Resource Monitoring System ==========");
+    logger("Database Host: " . STATS_DB_HOST);
+    logger("Database Name: " . STATS_DB_NAME);
+    logger("Collection Frequency: " . STATS_FREQUENCY_MINUTES . " minutes");
+    logger("Table Prefix: " . STATS_TABLE_PREFIX);
+    
+    # Register this machine
+    register_machine();
+    
+    logger("Resource monitoring system initialized successfully");
+    logger("============================================================");
+}
+
+sub check_resource_collection {
+    # Only collect if database settings are configured
+    return unless (STATS_DB_HOST && STATS_DB_USER && STATS_DB_NAME);
+    
+    my $current_time = time();
+    my $frequency_seconds = STATS_FREQUENCY_MINUTES * 60;
+    
+    # Check if it's time to collect stats
+    if ($current_time - $last_stats_time >= $frequency_seconds) {
+        logger("Time to collect resource statistics...");
+        
+        # Collect machine stats
+        eval {
+            collect_machine_stats();
+        };
+        if ($@) {
+            logger("Error collecting machine stats: $@");
+        }
+        
+        # Collect process stats
+        eval {
+            collect_process_stats();
+        };
+        if ($@) {
+            logger("Error collecting process stats: $@");
+        }
+        
+        $last_stats_time = $current_time;
+    }
 }
