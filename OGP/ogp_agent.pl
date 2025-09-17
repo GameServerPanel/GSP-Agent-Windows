@@ -4583,6 +4583,8 @@ sub get_database_connection {
     return undef unless (STATS_DB_HOST && STATS_DB_USER && STATS_DB_NAME);
     
     my $dsn = "DBI:mysql:database=" . STATS_DB_NAME . ";host=" . STATS_DB_HOST;
+    logger("Attempting database connection to " . STATS_DB_HOST . "/" . STATS_DB_NAME . " as " . STATS_DB_USER);
+    
     my $dbh = eval {
         DBI->connect($dsn, STATS_DB_USER, STATS_DB_PASS, {
             RaiseError => 1,
@@ -4596,6 +4598,7 @@ sub get_database_connection {
         return undef;
     }
     
+    logger("Database connection established successfully");
     return $dbh;
 }
 
@@ -4614,12 +4617,14 @@ sub register_machine {
         $ip = $1;
     }
     
+    logger("Registering machine: ID=$machine_id, Hostname=$hostname, IP=$ip");
+    
     eval {
         my $table = STATS_TABLE_PREFIX . 'machines';
         my $sth = $dbh->prepare("INSERT INTO $table (machine_id, hostname, ip) VALUES (?, ?, ?) 
                                ON DUPLICATE KEY UPDATE hostname=VALUES(hostname), ip=VALUES(ip)");
         $sth->execute($machine_id, $hostname, $ip);
-        logger("Machine registered/updated in database");
+        logger("Machine successfully registered/updated in database table: $table");
     };
     
     if ($@) {
@@ -4636,11 +4641,16 @@ sub collect_machine_stats {
     my $machine_id = get_machine_id();
     my $timestamp = strftime("%Y-%m-%d %H:%M:%S", localtime());
     
+    logger("Starting machine stats collection for machine: $machine_id");
+    
     # Collect CPU usage using Windows Performance Counters
     my $cpu_pct = 0;
     my $cpu_output = `wmic cpu get loadpercentage /value 2>/dev/null`;
     if ($cpu_output && $cpu_output =~ /LoadPercentage=(\d+)/i) {
         $cpu_pct = $1;
+        logger("CPU usage detected: ${cpu_pct}%");
+    } else {
+        logger("Warning: Could not retrieve CPU usage via wmic");
     }
     
     # Collect memory usage
@@ -4653,6 +4663,9 @@ sub collect_machine_stats {
         
         $mem_total = $total_kb * 1024;
         $mem_used = ($total_kb - $free_kb) * 1024;
+        logger("Memory usage detected: Total=" . sprintf("%.2f", $mem_total/1024/1024/1024) . "GB, Used=" . sprintf("%.2f", $mem_used/1024/1024/1024) . "GB");
+    } else {
+        logger("Warning: Could not retrieve memory usage via wmic");
     }
     
     # Collect disk usage for system drive
@@ -4665,6 +4678,9 @@ sub collect_machine_stats {
         
         $disk_total = $size;
         $disk_used = $size - $free;
+        logger("Disk usage detected: Total=" . sprintf("%.2f", $disk_total/1024/1024/1024) . "GB, Used=" . sprintf("%.2f", $disk_used/1024/1024/1024) . "GB");
+    } else {
+        logger("Warning: Could not retrieve disk usage via wmic");
     }
     
     my $mem_pct = $mem_total > 0 ? ($mem_used / $mem_total) * 100 : 0;
@@ -4680,7 +4696,8 @@ sub collect_machine_stats {
         $sth->execute($machine_id, $timestamp, $cpu_pct, $mem_used, $mem_total, $mem_pct,
                      'C:', $disk_total, $disk_used, $disk_pct);
         
-        logger("Machine stats collected: CPU: ${cpu_pct}%, Memory: ${mem_pct}%, Disk: ${disk_pct}%");
+        logger("Machine stats stored in database table: $table");
+        logger("Sample summary - CPU: ${cpu_pct}%, Memory: " . sprintf("%.2f", $mem_pct) . "%, Disk: " . sprintf("%.2f", $disk_pct) . "%");
     };
     
     if ($@) {
@@ -4697,12 +4714,16 @@ sub collect_process_stats {
     my $machine_id = get_machine_id();
     my $timestamp = strftime("%Y-%m-%d %H:%M:%S", localtime());
     
+    logger("Starting process stats collection for machine: $machine_id");
+    
     # Get list of game servers from startup directory
     return unless -d GAME_STARTUP_DIR;
     
     opendir(my $startup_dir, GAME_STARTUP_DIR) or return;
     my @startup_files = grep { !/^\./ && -f Path::Class::File->new(GAME_STARTUP_DIR, $_) } readdir($startup_dir);
     closedir($startup_dir);
+    
+    logger("Found " . scalar(@startup_files) . " game server startup files for monitoring");
     
     # Create lookup hash of server IPs and ports
     my %game_servers;
@@ -4724,6 +4745,7 @@ sub collect_process_stats {
                     chomp($line);
                     if ($line =~ /^(.+)$/) {
                         $game_servers{"$ip:$port"}{server_path} = $line;
+                        logger("Game server registered for monitoring: $ip:$port -> $line");
                         last;
                     }
                 }
@@ -4732,6 +4754,7 @@ sub collect_process_stats {
         }
     }
     
+    logger("Querying running processes via wmic...");
     # Get detailed process information using wmic
     my $process_output = `wmic process get ProcessId,Name,CommandLine,PageFileUsage,WorkingSetSize /format:csv 2>/dev/null`;
     
@@ -4769,6 +4792,8 @@ sub collect_process_stats {
         
         # Only collect stats for processes related to game servers
         next unless $matched_server;
+        
+        logger("Found monitored game server process: PID=$pid, Name=$name, Server=$matched_server->{server_name}");
         
         # Get additional process details
         my $cpu_pct = 0;
@@ -4815,6 +4840,8 @@ sub collect_process_stats {
                          $matched_server->{server_path}, $pid, $name, $cmd,
                          $cpu_pct, $working_set || 0, $page_file || 0, $mem_pct, 
                          $listening_ports, $folder_size);
+            
+            logger("Process stats stored: PID=$pid, Server=$matched_server->{server_name}, Memory=" . sprintf("%.2f", $mem_pct) . "%, Ports=$listening_ports");
         };
         
         if ($@) {
@@ -4822,6 +4849,7 @@ sub collect_process_stats {
         }
     }
     
+    logger("Process stats collection completed");
     $dbh->disconnect();
 }
 
@@ -4841,12 +4869,17 @@ sub init_resource_monitoring {
     # Only initialize if database settings are configured
     return unless (STATS_DB_HOST && STATS_DB_USER && STATS_DB_NAME);
     
-    logger("Initializing resource monitoring...");
+    logger("========== Initializing Resource Monitoring System ==========");
+    logger("Database Host: " . STATS_DB_HOST);
+    logger("Database Name: " . STATS_DB_NAME);
+    logger("Collection Frequency: " . STATS_FREQUENCY_MINUTES . " minutes");
+    logger("Table Prefix: " . STATS_TABLE_PREFIX);
     
     # Register this machine
     register_machine();
     
-    logger("Resource monitoring initialized successfully");
+    logger("Resource monitoring system initialized successfully");
+    logger("============================================================");
 }
 
 sub check_resource_collection {
