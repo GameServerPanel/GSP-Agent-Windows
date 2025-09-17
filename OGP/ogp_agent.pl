@@ -55,6 +55,7 @@ use DBI; # Database connectivity
 use Digest::MD5 qw(md5_hex); # For generating machine IDs
 use Socket; # For hostname/IP resolution
 use POSIX qw(strftime); # For timestamp formatting
+use Time::Local; # For timelocal function
 
 # Current location of the agent.
 use constant AGENT_RUN_DIR => getcwd();
@@ -112,8 +113,6 @@ our $log_std_out = 0;
 
 # Resource monitoring globals
 my $machine_id = '';
-my $last_stats_time = 0;
-my $stats_scheduler = undef;
 
 GetOptions(
 		   'no-startups'	=> \$no_startups,
@@ -299,11 +298,37 @@ my $cron = new Schedule::Cron( \&scheduler_dispatcher, {
                                        } );
 
 $cron->add_entry( "* * * * * *", \&scheduler_read_tasks );
+# Add resource stats collection task if configured
+if (defined STATS_FREQUENCY_MINUTES && STATS_FREQUENCY_MINUTES =~ /^\d+$/ && STATS_FREQUENCY_MINUTES > 0) {
+	logger "Scheduling resource stats collection every " . STATS_FREQUENCY_MINUTES . " minutes.";
+	logger "Resource stats collection task added with schedule: */" . STATS_FREQUENCY_MINUTES . " * * * *";
+	$cron->add_entry( "*/" . STATS_FREQUENCY_MINUTES . " * * * *", \&collect_and_submit_resource_stats );
+} else {
+	logger "Resource stats collection not configured or invalid frequency: " . (defined STATS_FREQUENCY_MINUTES ? STATS_FREQUENCY_MINUTES : 'undefined');
+}
+
+# Create scheduler directory if it doesn't exist
+my $sched_dir = Path::Class::Dir->new(AGENT_RUN_DIR, 'Schedule');
+if (!-d $sched_dir) {
+	if (mkpath($sched_dir)) {
+		logger "Created scheduler directory: $sched_dir";
+	} else {
+		logger "Failed to create scheduler directory: $sched_dir - $!";
+	}
+}
+
+# Create scheduler tasks file if it doesn't exist to prevent read errors
+if (!-e SCHED_TASKS) {
+	if (open(TASKS_INIT, '>', SCHED_TASKS)) {
+		logger "Created empty scheduler tasks file: " . SCHED_TASKS;
+		close(TASKS_INIT);
+	} else {
+		logger "Failed to create scheduler tasks file: " . SCHED_TASKS . " - $!";
+	}
+}
+
 # Run scheduler
 $cron->run( {detach=>1, pid_file=>SCHED_PID} );
-
-# Initialize resource monitoring
-init_resource_monitoring();
 
 if(-e Path::Class::File->new(FD_DIR, 'Settings.pm'))
 {
@@ -3581,6 +3606,67 @@ sub scheduler_dispatcher {
 	scheduler_log_events($log);
 }
 
+sub collect_and_submit_resource_stats {
+	my ($task, $args) = @_;
+	
+	logger "Automated resource stats collection started.";
+	scheduler_log_events("Resource stats collection started");
+	
+	eval {
+		# Check if database is configured
+		if (!defined STATS_DB_HOST || STATS_DB_HOST eq '' || 
+			!defined STATS_DB_USER || STATS_DB_USER eq '' ||
+			!defined STATS_DB_PASS || STATS_DB_PASS eq '' || STATS_DB_PASS eq 'REPLACE_ME' ||
+			!defined STATS_DB_NAME || STATS_DB_NAME eq '') {
+			logger "Resource stats database not configured - skipping database submission.";
+			scheduler_log_events("Resource stats database not configured - skipping submission");
+			return;
+		}
+		
+		# Collect all resource statistics for Windows
+		logger "Collecting resource usage statistics for Windows...";
+		
+		# Get CPU usage using Windows commands (or /proc/stat if in Cygwin)
+		my $avg_cpu_usage = get_cpu_usage_windows();
+		
+		# Get RAM usage using Windows commands (or /proc/meminfo if in Cygwin)
+		my ($mem_used, $mem_total, $mem_percent) = get_memory_usage_windows();
+		
+		# Get disk usage using Windows commands (or df if available in Cygwin)
+		my ($disk_used, $disk_total, $disk_free, $disk_percent) = get_disk_usage_windows();
+		
+		# Get uptime (Windows compatible)
+		my $uptime = get_uptime_windows();
+		
+		# Get load average (simulated for Windows)
+		my ($load_avg_1min, $load_avg_5min, $load_avg_15min) = get_load_average_windows();
+		
+		# Log the collected statistics
+		my $stats_summary = "CPU: ${avg_cpu_usage}%, Memory: ${mem_percent}% (${mem_used}/${mem_total} bytes), Disk: ${disk_percent}% (${disk_used}/${disk_total} bytes), Uptime: ${uptime}s, Load: ${load_avg_1min}/${load_avg_5min}/${load_avg_15min}";
+		logger "Scheduled resource stats collection - $stats_summary";
+		scheduler_log_events("Resource usage collected - $stats_summary");
+		
+		# Submit to database
+		my $submit_result = submit_resource_stats_to_db_windows($avg_cpu_usage, $mem_used, $mem_total, $mem_percent, $disk_used, $disk_total, $disk_free, $disk_percent, $uptime, $load_avg_1min, $load_avg_5min, $load_avg_15min);
+		
+		if ($submit_result == 1) {
+			logger "Scheduled resource statistics successfully submitted to MySQL database.";
+			scheduler_log_events("Resource stats successfully submitted to MySQL database");
+		} elsif ($submit_result == -1) {
+			logger "Scheduled resource stats: database not configured - skipping submission.";
+			scheduler_log_events("Resource stats: database not configured - skipping submission");
+		} else {
+			logger "Scheduled resource stats: failed to submit to MySQL database - error occurred.";
+			scheduler_log_events("Resource stats: failed to submit to MySQL database - error occurred");
+		}
+	};
+	
+	if ($@) {
+		logger "Error in scheduled resource stats collection: $@";
+		scheduler_log_events("Error in resource stats collection: $@");
+	}
+}
+
 sub scheduler_server_action
 {
 	my ($task, $args) = @_;
@@ -3787,9 +3873,6 @@ sub scheduler_read_tasks
 		}
 	}
 	close(TASKS);
-	
-	# Check for resource monitoring collection (called every second)
-	check_resource_collection();
 	
 	return 1;
 }
@@ -4546,6 +4629,317 @@ sub begins_with
 }
 
 # Resource monitoring functions
+
+# Windows-compatible resource gathering functions
+sub get_cpu_usage_windows {
+	my $cpu_usage = 0;
+	
+	# Try /proc/stat first (if running under Cygwin)
+	if (-e '/proc/stat') {
+		my %prev_idle;
+		my %prev_total;
+		if (open(STAT, '/proc/stat')) {
+			while (<STAT>) {
+				next unless /^cpu([0-9]+)/;
+				my @stat = split /\s+/, $_;
+				$prev_idle{$1} = $stat[4];
+				$prev_total{$1} = $stat[1] + $stat[2] + $stat[3] + $stat[4];
+			}
+			close STAT;
+			sleep 1;
+			my %idle;
+			my %total;
+			if (open(STAT, '/proc/stat')) {
+				while (<STAT>) {
+					next unless /^cpu([0-9]+)/;
+					my @stat = split /\s+/, $_;
+					$idle{$1} = $stat[4];
+					$total{$1} = $stat[1] + $stat[2] + $stat[3] + $stat[4];
+				}
+				close STAT;
+				my $total_cpu_usage = 0;
+				my $cpu_core_count = 0;
+				foreach my $key ( keys %idle )
+				{
+					my $diff_idle = $idle{$key} - $prev_idle{$key};
+					my $diff_total = $total{$key} - $prev_total{$key};
+					my $percent = (100 * ($diff_total - $diff_idle)) / $diff_total;
+					$percent = sprintf "%.2f", $percent unless $percent == 0;
+					$total_cpu_usage += $percent;
+					$cpu_core_count++;
+				}
+				$cpu_usage = $cpu_core_count > 0 ? sprintf("%.2f", $total_cpu_usage / $cpu_core_count) : 0;
+			}
+		}
+	} else {
+		# Use Windows wmic command
+		my $cpu_output = `wmic cpu get loadpercentage /value 2>/dev/null`;
+		if ($cpu_output && $cpu_output =~ /LoadPercentage=(\d+)/i) {
+			$cpu_usage = $1;
+		}
+	}
+	
+	return $cpu_usage;
+}
+
+sub get_memory_usage_windows {
+	my ($mem_used, $mem_total, $mem_percent) = (0, 0, 0);
+	
+	# Try /proc/meminfo first (if running under Cygwin)
+	if (-e '/proc/meminfo') {
+		my ($buffers, $cached, $mem_free) = (0, 0, 0);
+		if (open(STAT, '/proc/meminfo')) {
+			while (<STAT>) {
+				$mem_total   += $1 if /MemTotal\:\s+(\d+) kB/;
+				$buffers += $1 if /Buffers\:\s+(\d+) kB/;
+				$cached  += $1 if /Cached\:\s+(\d+) kB/;
+				$mem_free    += $1 if /MemFree\:\s+(\d+) kB/;
+			}
+			close STAT;
+			$mem_used = $mem_total - $mem_free - $cached - $buffers;
+			$mem_percent = $mem_total > 0 ? sprintf("%.2f", 100 * $mem_used / $mem_total) : 0;
+			$mem_total *= 1024; # Convert to bytes
+			$mem_used *= 1024;  # Convert to bytes
+		}
+	} else {
+		# Use Windows wmic command
+		my $mem_output = `wmic OS get TotalVisibleMemorySize,FreePhysicalMemory /value 2>/dev/null`;
+		if ($mem_output) {
+			my ($total_kb, $free_kb) = (0, 0);
+			if ($mem_output =~ /TotalVisibleMemorySize=(\d+)/i) { $total_kb = $1; }
+			if ($mem_output =~ /FreePhysicalMemory=(\d+)/i) { $free_kb = $1; }
+			
+			$mem_total = $total_kb * 1024;
+			$mem_used = ($total_kb - $free_kb) * 1024;
+			$mem_percent = $mem_total > 0 ? sprintf("%.2f", 100 * $mem_used / $mem_total) : 0;
+		}
+	}
+	
+	return ($mem_used, $mem_total, $mem_percent);
+}
+
+sub get_disk_usage_windows {
+	my ($disk_used, $disk_total, $disk_free, $disk_percent) = (0, 0, 0, 0);
+	
+	# Try df command first (if available in Cygwin)
+	my $df_output = `df -lP 2>/dev/null | grep -E "^/dev/|^[A-Z]:" | head -1`;
+	if ($df_output && $df_output =~ /\s+(\d+)\s+(\d+)\s+(\d+)\s+/) {
+		$disk_total = $1 * 1024; # Convert to bytes
+		$disk_used = $2 * 1024;  # Convert to bytes
+		$disk_free = $3 * 1024;  # Convert to bytes
+		$disk_percent = $disk_total > 0 ? sprintf("%.2f", 100 * $disk_used / $disk_total) : 0;
+	} else {
+		# Use Windows wmic command for C: drive
+		my $disk_output = `wmic logicaldisk where "DeviceID='C:'" get Size,FreeSpace /value 2>/dev/null`;
+		if ($disk_output) {
+			my ($size, $free) = (0, 0);
+			if ($disk_output =~ /Size=(\d+)/i) { $size = $1; }
+			if ($disk_output =~ /FreeSpace=(\d+)/i) { $free = $1; }
+			
+			$disk_total = $size;
+			$disk_used = $size - $free;
+			$disk_free = $free;
+			$disk_percent = $disk_total > 0 ? sprintf("%.2f", 100 * $disk_used / $disk_total) : 0;
+		}
+	}
+	
+	return ($disk_used, $disk_total, $disk_free, $disk_percent);
+}
+
+sub get_uptime_windows {
+	my $uptime = 0;
+	
+	# Try /proc/uptime first (if running under Cygwin)
+	if (-e '/proc/uptime' && open(STAT, '/proc/uptime')) {
+		while (<STAT>) {
+			$uptime += $1 if /^([0-9]+)/;
+		}
+		close STAT;
+	} else {
+		# Use Windows wmic command to get boot time and calculate uptime
+		my $boot_output = `wmic os get lastbootuptime /value 2>/dev/null`;
+		if ($boot_output && $boot_output =~ /LastBootUpTime=(\d{14})/i) {
+			my $boot_time_str = $1;
+			# Parse YYYYMMDDHHMMSS format
+			if ($boot_time_str =~ /^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})/) {
+				my ($year, $month, $day, $hour, $min, $sec) = ($1, $2, $3, $4, $5, $6);
+				my $boot_time = timelocal($sec, $min, $hour, $day, $month - 1, $year - 1900);
+				$uptime = time() - $boot_time;
+			}
+		}
+	}
+	
+	return $uptime;
+}
+
+sub get_load_average_windows {
+	my ($load_avg_1min, $load_avg_5min, $load_avg_15min) = ("0", "0", "0");
+	
+	# Try /proc/loadavg first (if running under Cygwin)  
+	if (-e '/proc/loadavg' && open(LOADAVG, '/proc/loadavg')) {
+		while (<LOADAVG>) {
+			if (/^(\S+)\s+(\S+)\s+(\S+)/) {
+				$load_avg_1min = $1;
+				$load_avg_5min = $2;
+				$load_avg_15min = $3;
+			}
+		}
+		close LOADAVG;
+	} else {
+		# Windows doesn't have load average, so simulate it using CPU usage
+		my $cpu_usage = get_cpu_usage_windows();
+		my $simulated_load = sprintf("%.2f", $cpu_usage / 100);
+		$load_avg_1min = $simulated_load;
+		$load_avg_5min = $simulated_load;
+		$load_avg_15min = $simulated_load;
+	}
+	
+	return ($load_avg_1min, $load_avg_5min, $load_avg_15min);
+}
+
+sub submit_resource_stats_to_db_windows
+{
+	my ($cpu_usage, $mem_used, $mem_total, $mem_percent, $disk_used, $disk_total, $disk_free, $disk_percent, $uptime, $load_1min, $load_5min, $load_15min) = @_;
+	
+	# Check if database is configured
+	if (!defined STATS_DB_HOST || STATS_DB_HOST eq '' || 
+		!defined STATS_DB_USER || STATS_DB_USER eq '' ||
+		!defined STATS_DB_PASS || STATS_DB_PASS eq '' || STATS_DB_PASS eq 'REPLACE_ME' ||
+		!defined STATS_DB_NAME || STATS_DB_NAME eq '') {
+		logger "Resource stats database not configured - skipping database submission.";
+		scheduler_log_events("Resource stats database not configured - skipping submission");
+		return -1;
+	}
+	
+	my $dbh;
+	eval {
+		# Connect to MySQL database
+		my $dsn = "DBI:mysql:database=" . STATS_DB_NAME . ";host=" . STATS_DB_HOST;
+		logger "Attempting to connect to MySQL database: $dsn (user: " . STATS_DB_USER . ")";
+		$dbh = DBI->connect($dsn, STATS_DB_USER, STATS_DB_PASS, {
+			RaiseError => 1,
+			AutoCommit => 1,
+			mysql_enable_utf8 => 1
+		});
+		
+		if (!$dbh) {
+			logger "Failed to connect to MySQL database: $DBI::errstr";
+			return 0;
+		}
+		
+		logger "Successfully connected to MySQL database for resource stats submission.";
+		
+		# Create the proper database tables based on the schema files
+		create_resource_stats_tables_windows($dbh);
+		
+		# Get machine information
+		my $machine_id = get_machine_id();
+		my $hostname = `hostname` || 'unknown';
+		chomp($hostname);
+		my $ip = get_local_ip_windows();
+		
+		# Ensure the machine is registered
+		ensure_machine_registered_windows($dbh, $machine_id, $hostname, $ip);
+		
+		# Get additional system metrics for proper schema compliance
+		my ($swap_used, $swap_total, $disk_path, $net_iface, $rx_bytes, $tx_bytes, $iface_speed) = get_extended_system_metrics_windows();
+		
+		# Insert machine-level resource sample
+		insert_machine_sample_windows($dbh, $machine_id, $cpu_usage, $mem_used, $mem_total, $mem_percent, 
+		                     $swap_used, $swap_total, $disk_path, $disk_total, $disk_used, $disk_percent,
+		                     $net_iface, $rx_bytes, $tx_bytes, $iface_speed, $load_1min, $load_5min, $load_15min);
+		
+		# Collect and insert per-process/server resource samples
+		collect_and_insert_process_samples_windows($dbh, $machine_id);
+		
+		$dbh->disconnect();
+		
+		logger "Resource statistics inserted into database successfully.";
+		return 1;
+	};
+	
+	if ($@) {
+		logger "Error submitting resource stats to database: $@";
+		if ($dbh) {
+			$dbh->disconnect();
+		}
+		return 0;
+	}
+	
+	return 1;
+}
+
+sub submit_resource_stats_to_db_windows
+{
+	my ($cpu_usage, $mem_used, $mem_total, $mem_percent, $disk_used, $disk_total, $disk_free, $disk_percent, $uptime, $load_1min, $load_5min, $load_15min) = @_;
+	
+	# Check if database is configured
+	if (!defined STATS_DB_HOST || STATS_DB_HOST eq '' || 
+		!defined STATS_DB_USER || STATS_DB_USER eq '' ||
+		!defined STATS_DB_PASS || STATS_DB_PASS eq '' || STATS_DB_PASS eq 'REPLACE_ME' ||
+		!defined STATS_DB_NAME || STATS_DB_NAME eq '') {
+		logger "Resource stats database not configured - skipping database submission.";
+		scheduler_log_events("Resource stats database not configured - skipping submission");
+		return -1;
+	}
+	
+	my $dbh;
+	eval {
+		# Connect to MySQL database
+		my $dsn = "DBI:mysql:database=" . STATS_DB_NAME . ";host=" . STATS_DB_HOST;
+		logger "Attempting to connect to MySQL database: $dsn (user: " . STATS_DB_USER . ")";
+		$dbh = DBI->connect($dsn, STATS_DB_USER, STATS_DB_PASS, {
+			RaiseError => 1,
+			AutoCommit => 1,
+			mysql_enable_utf8 => 1
+		});
+		
+		if (!$dbh) {
+			logger "Failed to connect to MySQL database: $DBI::errstr";
+			return 0;
+		}
+		
+		logger "Successfully connected to MySQL database for resource stats submission.";
+		
+		# Create the proper database tables based on the schema files
+		create_resource_stats_tables_windows($dbh);
+		
+		# Get machine information
+		my $machine_id = get_machine_id();
+		my $hostname = `hostname` || 'unknown';
+		chomp($hostname);
+		my $ip = get_local_ip_windows();
+		
+		# Ensure the machine is registered
+		ensure_machine_registered_windows($dbh, $machine_id, $hostname, $ip);
+		
+		# Get additional system metrics for proper schema compliance
+		my ($swap_used, $swap_total, $disk_path, $net_iface, $rx_bytes, $tx_bytes, $iface_speed) = get_extended_system_metrics_windows();
+		
+		# Insert machine-level resource sample
+		insert_machine_sample_windows($dbh, $machine_id, $cpu_usage, $mem_used, $mem_total, $mem_percent, 
+		                     $swap_used, $swap_total, $disk_path, $disk_total, $disk_used, $disk_percent,
+		                     $net_iface, $rx_bytes, $tx_bytes, $iface_speed, $load_1min, $load_5min, $load_15min);
+		
+		# Collect and insert per-process/server resource samples
+		collect_and_insert_process_samples_windows($dbh, $machine_id);
+		
+		$dbh->disconnect();
+		
+		logger "Resource statistics inserted into database successfully.";
+		return 1;
+	};
+	
+	if ($@) {
+		logger "Error submitting resource stats to database: $@";
+		if ($dbh) {
+			$dbh->disconnect();
+		}
+		return 0;
+	}
+	
+	return 1;
+}
 
 sub get_machine_id {
     if ($machine_id eq '') {
