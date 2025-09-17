@@ -113,6 +113,7 @@ our $log_std_out = 0;
 
 # Resource monitoring globals
 my $machine_id = '';
+my $last_stats_time = 0;
 
 GetOptions(
 		   'no-startups'	=> \$no_startups,
@@ -4795,78 +4796,6 @@ sub get_load_average_windows {
 	}
 	
 	return ($load_avg_1min, $load_avg_5min, $load_avg_15min);
-}
-
-sub submit_resource_stats_to_db_windows
-{
-	my ($cpu_usage, $mem_used, $mem_total, $mem_percent, $disk_used, $disk_total, $disk_free, $disk_percent, $uptime, $load_1min, $load_5min, $load_15min) = @_;
-	
-	# Check if database is configured
-	if (!defined STATS_DB_HOST || STATS_DB_HOST eq '' || 
-		!defined STATS_DB_USER || STATS_DB_USER eq '' ||
-		!defined STATS_DB_PASS || STATS_DB_PASS eq '' || STATS_DB_PASS eq 'REPLACE_ME' ||
-		!defined STATS_DB_NAME || STATS_DB_NAME eq '') {
-		logger "Resource stats database not configured - skipping database submission.";
-		scheduler_log_events("Resource stats database not configured - skipping submission");
-		return -1;
-	}
-	
-	my $dbh;
-	eval {
-		# Connect to MySQL database
-		my $dsn = "DBI:mysql:database=" . STATS_DB_NAME . ";host=" . STATS_DB_HOST;
-		logger "Attempting to connect to MySQL database: $dsn (user: " . STATS_DB_USER . ")";
-		$dbh = DBI->connect($dsn, STATS_DB_USER, STATS_DB_PASS, {
-			RaiseError => 1,
-			AutoCommit => 1,
-			mysql_enable_utf8 => 1
-		});
-		
-		if (!$dbh) {
-			logger "Failed to connect to MySQL database: $DBI::errstr";
-			return 0;
-		}
-		
-		logger "Successfully connected to MySQL database for resource stats submission.";
-		
-		# Create the proper database tables based on the schema files
-		create_resource_stats_tables_windows($dbh);
-		
-		# Get machine information
-		my $machine_id = get_machine_id();
-		my $hostname = `hostname` || 'unknown';
-		chomp($hostname);
-		my $ip = get_local_ip_windows();
-		
-		# Ensure the machine is registered
-		ensure_machine_registered_windows($dbh, $machine_id, $hostname, $ip);
-		
-		# Get additional system metrics for proper schema compliance
-		my ($swap_used, $swap_total, $disk_path, $net_iface, $rx_bytes, $tx_bytes, $iface_speed) = get_extended_system_metrics_windows();
-		
-		# Insert machine-level resource sample
-		insert_machine_sample_windows($dbh, $machine_id, $cpu_usage, $mem_used, $mem_total, $mem_percent, 
-		                     $swap_used, $swap_total, $disk_path, $disk_total, $disk_used, $disk_percent,
-		                     $net_iface, $rx_bytes, $tx_bytes, $iface_speed, $load_1min, $load_5min, $load_15min);
-		
-		# Collect and insert per-process/server resource samples
-		collect_and_insert_process_samples_windows($dbh, $machine_id);
-		
-		$dbh->disconnect();
-		
-		logger "Resource statistics inserted into database successfully.";
-		return 1;
-	};
-	
-	if ($@) {
-		logger "Error submitting resource stats to database: $@";
-		if ($dbh) {
-			$dbh->disconnect();
-		}
-		return 0;
-	}
-	
-	return 1;
 }
 
 sub submit_resource_stats_to_db_windows
