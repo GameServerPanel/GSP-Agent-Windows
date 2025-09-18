@@ -153,24 +153,24 @@ then
 		ip=$DEFAULT_IP
 	fi 
 
-	while [ 1 ]
-	do
-		echo
-		echo "For some games the OGP panel is using Steam client."
-		echo "This client has its own license that you need to agree before continuing."
-		echo "This agreement is available at http://store.steampowered.com/subscriber_agreement/"
-		echo;
-		echo "Do you accept the terms of Steam(tm) Subscriber Agreement?"
-		echo -n "(Accept|Reject): "
-		read steam_license
-		
-		if [ "$steam_license" == "Accept" -o "$steam_license" == "Reject" ]
-		then	 
-			break;
-		fi
-		
-		echo "You need to type either 'Accept' or 'Reject'."
-	done
+while [ 1 ]
+do
+    echo
+    echo "By using this software, you agree to the terms of the Steam(tm) Subscriber Agreement."
+    echo "The agreement is available at: http://store.steampowered.com/subscriber_agreement/"
+    echo
+    echo "Press Enter to continue or type 'exit' to quit."
+    read user_input
+
+    if [ -z "$user_input" ]; then
+        break
+    elif [ "$user_input" == "exit" ]; then
+        echo "Exiting setup."
+        exit 1
+    fi
+
+    echo "Invalid input. Press Enter to continue or type 'exit' to quit."
+done
 
 	echo "Writing Config file - $cfgfile"
 
