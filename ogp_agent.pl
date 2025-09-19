@@ -484,7 +484,7 @@ sub create_screen_cmd
 sub create_screen_cmd_loop
 {
 	my ($screen_id, $exec_cmd, $priority, $affinity, $envVars) = @_;
-	my $server_start_batfile = $screen_id . "_startup_scr.bat";
+	my $server_start_batfile = "_serverStart.bat";
 	
 	$exec_cmd = replace_OGP_Env_Vars($screen_id, "", "", $exec_cmd);
 	
@@ -909,7 +909,7 @@ sub universal_start_without_decrypt
 
 	# Create startup file for the server.
 	my $startup_file =
-	  Path::Class::File->new(GAME_STARTUP_DIR, "$server_ip-$server_port");
+	  Path::Class::File->new(GAME_STARTUP_DIR, "_serverStart.bat");
 
 	if (open(STARTUP, '>', $startup_file))
 	{
@@ -1596,7 +1596,7 @@ sub run_before_start_commands
 		{		
 			logger "Running pre-start XML commands before starting server ID $server_id with a home directory of $homedir.";
 			my @prestartcmdlines = split /[\r\n]+/, $beforestartcmd;
-			my $prestartcmdfile = $windows_home_path . '\prestart_ogp.bat';
+			my $prestartcmdfile = $windows_home_path . '\_prestart.bat';
 			open  FILE, '>', $prestartcmdfile;
 			print FILE "cd \"$windows_home_path\"\r\n";
 			foreach my $line (@prestartcmdlines) {
