@@ -91,7 +91,7 @@ use constant FD_PID_FILE => Path::Class::File->new(FD_DIR, 'fd.pid');
 use constant SCHED_PID => Path::Class::File->new(AGENT_RUN_DIR, 'scheduler.pid');
 use constant SCHED_TASKS => Path::Class::File->new(AGENT_RUN_DIR, 'scheduler.tasks');
 use constant SCHED_LOG_FILE => Path::Class::File->new(AGENT_RUN_DIR, 'scheduler.log');
-use constant USER_RUNNING_SCRIPT => getlogin || getpwuid($<) || "cyg_server";
+use constant USER_RUNNING_SCRIPT => getlogin || getpwuid($<) || "gameserver";
 
 my $no_startups	= 0;
 my $clear_startups = 0;
@@ -1107,6 +1107,9 @@ sub stop_server_without_decrypt
 {
     my ($home_id, $server_ip, $server_port, $control_protocol,
         $control_password, $control_type, $home_path) = @_;
+
+	# Clean up dead screen sessions before stopping
+    system("screen -wipe");
         
     my $startup_file = Path::Class::File->new(GAME_STARTUP_DIR, "$server_ip-$server_port");
     

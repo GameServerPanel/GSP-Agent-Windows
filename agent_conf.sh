@@ -32,7 +32,7 @@ Usage: $0 option
 
 OPTIONS:
    -s password       Set the password for the agent's user (Linux)
-   -p password       Set the password for cyg_server user (Windows)
+   -p password       Set the password for gameserver user (Windows)
 
 EOF
 }
@@ -569,7 +569,7 @@ done
 				if [ ! -z "$cs_psw" ]; then
 					UD=$(cmd /Q /C echo %USERDOMAIN% | sed 's/\r$//')
 					net stop "FileZilla Server"
-					sc config "FileZilla Server" obj= "${UD}\cyg_server" password= "$cs_psw" type= own
+					sc config "FileZilla Server" obj= "${UD}\gameserver" password= "$cs_psw" type= own
 					net start "FileZilla Server"
 				fi
 			else
