@@ -1105,188 +1105,51 @@ sub stop_server
 ### Return 0 on success
 sub stop_server_without_decrypt
 {
-	my ($home_id, $server_ip, $server_port, $control_protocol,
-		$control_password, $control_type, $home_path) = @_;
-		
-	my $usedProtocolToStop = 0;
-		
-	my $startup_file = Path::Class::File->new(GAME_STARTUP_DIR, "$server_ip-$server_port");
-	
-	if (-e $startup_file)
-	{
-		logger "Removing startup flag " . $startup_file . "";
-		unlink($startup_file)
-		  or logger "Cannot remove the startup flag file $startup_file $!";
-	}
-	
-	# Create file indicator that the game server has been stopped if defined
-	if(defined($Cfg::Preferences{ogp_autorestart_server}) &&  $Cfg::Preferences{ogp_autorestart_server} eq "1"){
-		
-		# Get current directory and chdir into the game's home dir
-		my $curDir = getcwd();
-		chdir $home_path;
+    my ($home_id, $server_ip, $server_port, $control_protocol,
+        $control_password, $control_type, $home_path) = @_;
+        
+    my $startup_file = Path::Class::File->new(GAME_STARTUP_DIR, "$server_ip-$server_port");
+    
+    if (-e $startup_file)
+    {
+        logger "Removing startup flag " . $startup_file . "";
+        unlink($startup_file)
+          or logger "Cannot remove the startup flag file $startup_file $!";
+    }
+    
+    # Create file indicator that the game server has been stopped if defined
+    if(defined($Cfg::Preferences{ogp_autorestart_server}) &&  $Cfg::Preferences{ogp_autorestart_server} eq "1"){
+        
+        # Get current directory and chdir into the game's home dir
+        my $curDir = getcwd();
+        chdir $home_path;
 
-		# Create stopped indicator file used by autorestart of OGP if server crashes
-		open(STOPFILE, '>', "SERVER_STOPPED");
-		close(STOPFILE);
-		
-		# Return to original directory
-		chdir $curDir;
-	}
-		
-	my $screen_id = create_screen_id(SCREEN_TYPE_HOME, $home_id);
-	my $get_screen_pid = "screen -list | grep $screen_id | cut -f1 -d'.' | sed '".'s/\W//g'."' | head -1";
-	my $screen_pid = `$get_screen_pid`;	 
-	
-	chomp $screen_pid;
-	
-	my $windows_pid_command = "ps -W | grep '" . $screen_pid . "' | head -1 | awk '{print \$4}'";
-	my $windows_pid = `$windows_pid_command`;
-	
-	chomp $windows_pid;
-	
-	# Some validation checks for the variables.
-	if ($server_ip =~ /^\s*$/ || $server_port < 0 || $server_port > 65535)
-	{
-		logger("Invalid IP:Port given $server_ip:$server_port.");
-		return 1;
-	}
+        # Create stopped indicator file used by autorestart of OGP if server crashes
+        open(STOPFILE, '>', "SERVER_STOPPED");
+        close(STOPFILE);
+        
+        # Return to original directory
+        chdir $curDir;
+    }
+        
+    my $screen_id = create_screen_id(SCREEN_TYPE_HOME, $home_id);
+    my $get_screen_pid = "screen -list | grep $screen_id | cut -f1 -d'.' | sed '".'s/\W//g'."' | head -1";
+    my $screen_pid = `$get_screen_pid`;	 
+    
+    chomp $screen_pid;
+    
+    my $windows_pid_command = "ps -W | grep '" . $screen_pid . "' | head -1 | awk '{print \$4}'";
+    my $windows_pid = `$windows_pid_command`;
+    
+    chomp $windows_pid;
 
-	if ($control_password !~ /^\s*$/ and $control_protocol ne "")
-	{
-		if ($control_protocol eq "rcon")
-		{
-			use KKrcon::KKrcon;
-			my $rcon = new KKrcon(
-								  Password => $control_password,
-								  Host	 => $server_ip,
-								  Port	 => $server_port,
-								  Type	 => $control_type
-								 );
-
-			my $rconCommand = "quit";
-			$rcon->execute($rconCommand);
-			$usedProtocolToStop = 1;
-		}
-		elsif ($control_protocol eq "rcon2")
-		{
-			use KKrcon::HL2;
-			my $rcon2 = new HL2(
-								  hostname => $server_ip,
-								  port	 => $server_port,
-								  password => $control_password,
-								  timeout  => 2
-								 );
-
-			my $rconCommand = "quit";
-			$rcon2->run($rconCommand);
-			$usedProtocolToStop = 1;
-		}
-		elsif ($control_protocol eq "armabe")
-		{
-			use ArmaBE::ArmaBE;
-			my $armabe = new ArmaBE(
-								  hostname => $server_ip,
-								  port	 => $server_port, # Uses server port for now (Arma 2), Arma 3 BE uses a different, user definable port
-								  password => $control_password,
-								  timeout  => 2
-								 );
-
-			my $rconCommand = "#shutdown";
-			my $armabe_result = $armabe->run($rconCommand);
-			if ($armabe_result) {
-				logger "ArmaBE Shutdown command sent successfully";
-				$usedProtocolToStop = 1;
-			}
-		}
-		elsif ($control_protocol eq "minecraft")
-		{
-			use Minecraft::RCON;
-			my $strip_color = 1;
-			
-			my $rconPort = get_minecraft_rcon_port($home_path);
-			
-			logger "Minecraft rcon port detected as $rconPort with path of $home_path";
-			
-			if ($rconPort != -1){
-				my $minecraft;
-				my $response;
-				
-				eval {
-					$minecraft = Minecraft::RCON->new(
-						{
-							address     => $server_ip,
-							port        => $rconPort,
-							password    => $control_password,
-							color_mode  => $strip_color ? 'strip' : 'convert',
-						}
-					);
-				};
-				
-				if (defined $minecraft)
-				{
-					eval { $minecraft->connect };
-					logger "Minecraft rcon module connection failed: $@" if $@;
-					 
-					
-					my $rconCommand = "/stop";
-					eval { $response = $minecraft->command($rconCommand) };
-					logger $@ ? "Minecraft rcon error: $@" : "Minecraft rcon module response: $response";
-	 
-					eval { $minecraft->disconnect; };
-					
-					if (defined $response) {
-						logger "Minecraft Shutdown command sent successfully";
-						$usedProtocolToStop = 1;
-					}
-				}
-			}
-		}
-		system('screen -wipe > /dev/null 2>&1');
-	}
-	else
-	{
-		logger "Control protocol not supported. Using kill signal to stop the server.";
-		my $screen_id = create_screen_id(SCREEN_TYPE_HOME, $home_id);
-		system("cmd /C taskkill /f /fi 'PID eq $windows_pid' /T");
-		system('screen -wipe > /dev/null 2>&1');
-	}
-		
-	# Gives the server time to shutdown with rcon in case it takes a while for the server to shutdown (arma for example) before we forcefully kill it
-	if ($usedProtocolToStop == 1){
-		my $serverIsRunning = (is_screen_running_without_decrypt(SCREEN_TYPE_HOME, $home_id) == 1);
-		my $timeWaited = 0;
-		my $maxWaitTime = 5;
-			
-		# Maximum time to wait can now be configured as a preference
-		if(defined($Cfg::Preferences{protocol_shutdown_waittime}) && $Cfg::Preferences{protocol_shutdown_waittime} =~ /^\d+?$/){
-			$maxWaitTime = $Cfg::Preferences{protocol_shutdown_waittime};
-		}
-		
-		while ($serverIsRunning && $timeWaited < $maxWaitTime) {
-			select(undef, undef, undef, 0.25); # Sleeps for 250ms
-			
-			# Add to time waited
-			$timeWaited += 0.25;
-			
-			# Recheck if server is running
-			$serverIsRunning = (is_screen_running_without_decrypt(SCREEN_TYPE_HOME, $home_id) == 1);
-		}
-	}
-	
-	if (is_screen_running_without_decrypt(SCREEN_TYPE_HOME, $home_id) == 1)
-	{
-		logger "Control protocol not responding. Using kill signal.";
-		system("cmd /C taskkill /f /fi 'PID eq $windows_pid' /T");
-		system('screen -wipe > /dev/null 2>&1');
-		logger "Server ID $home_id:Stopped server running on $server_ip:$server_port.";
-		return 0;
-	}
-	else
-	{
-		logger "Server ID $home_id:Stopped server running on $server_ip:$server_port.";
-		return 0;
-	}
+    # Immediately kill the process
+    logger "Immediately killing server process with PID $windows_pid.";
+    system("cmd /C taskkill /f /fi 'PID eq $windows_pid' /T");
+    system('screen -wipe > /dev/null 2>&1');
+    logger "Server ID $home_id: Process killed.";
+    
+    return 0;
 }
 
 ##### Send RCON command 
