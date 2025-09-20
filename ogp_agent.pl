@@ -91,7 +91,7 @@ use constant FD_PID_FILE => Path::Class::File->new(FD_DIR, 'fd.pid');
 use constant SCHED_PID => Path::Class::File->new(AGENT_RUN_DIR, 'scheduler.pid');
 use constant SCHED_TASKS => Path::Class::File->new(AGENT_RUN_DIR, 'scheduler.tasks');
 use constant SCHED_LOG_FILE => Path::Class::File->new(AGENT_RUN_DIR, 'scheduler.log');
-use constant USER_RUNNING_SCRIPT => getlogin || getpwuid($<) || "gameserver";
+use constant USER_RUNNING_SCRIPT => getlogin || getpwuid($<) || "cyg_server";
 
 my $no_startups	= 0;
 my $clear_startups = 0;
@@ -497,20 +497,22 @@ sub create_screen_cmd_loop
 	
 	if(defined $envVars && $envVars ne ""){
 		$batch_server_command .= $envVars;
-	}
-	
-	$batch_server_command .= "set STARTTIME=%TIME: =0%" . "\r\n"
-	. "start " . $priority . " " . $affinity . " /wait " . $exec_cmd . "\r\n"
-	. "set ENDTIME=%TIME: =0%" . "\r\n"
-	. "set \"end=!ENDTIME:%time:~8,1%=%%100)*100+1!\"  &  set \"start=!STARTTIME:%time:~8,1%=%%100)*100+1!\"" . "\r\n"
-	. "set /A \"elap=((((10!end:%time:~2,1%=%%100)*60+1!%%100)-((((10!start:%time:~2,1%=%%100)*60+1!%%100)\"" . "\r\n"
-	. "set /A \"cc=elap%%100+100,elap/=100,ss=elap%%60+100,elap/=60,mm=elap%%60+100,hh=elap/60+100\"" . "\r\n"
-	. "set hour=%hh:~1%" . "\r\n"
-	. "set minute=%mm:~1%" . "\r\n"
-	. "set second=%ss:~1%" . "\r\n"
-	. "if exist SERVER_STOPPED exit" . "\r\n"
-	. "IF \"%hour%\" == \"00\" IF \"%minute%\" == \"00\" IF %second% lss 15 exit" . "\r\n"
-	. "goto TOP" . "\r\n";
+	}# lines 500-515, inside sub create_screen_cmd_loop
+$batch_server_command .= "set STARTTIME=%TIME: =0%" . "\r\n"
+    . "\@echo off\r\n"
+    . "if exist \"_alsoRun.bat\" call \"_alsoRun.bat\"\r\n"
+    . "start $priority $affinity /wait $exec_cmd\r\n"
+    . "for /f %%p in (_alsoRun.pid) do taskkill /PID %%p /F\r\n"
+    . "set ENDTIME=%TIME: =0%\r\n"
+    . "set \"end=!ENDTIME:%time:~8,1%=%%100)*100+1!\"  &  set \"start=!STARTTIME:%time:~8,1%=%%100)*100+1!\"\r\n"
+    . "set /A \"elap=((((10!end:%time:~2,1%=%%100)*60+1!%%100)-((((10!start:%time:~2,1%=%%100)*60+1!%%100)\"\r\n"
+    . "set /A \"cc=elap%%100+100,elap/=100,ss=elap%%60+100,elap/=60,mm=elap%%60+100,hh=elap/60+100\"\r\n"
+    . "set hour=%hh:~1%\r\n"
+    . "set minute=%mm:~1%\r\n"
+    . "set second=%ss:~1%\r\n"
+    . "if exist SERVER_STOPPED exit\r\n"
+    . "IF \"%hour%\" == \"00\" IF \"%minute%\" == \"00\" IF %second% lss 60 exit\r\n"
+    . "goto TOP\r\n";
 	
 	print SERV_START_BAT_SCRIPT $batch_server_command;
 	close (SERV_START_BAT_SCRIPT);
