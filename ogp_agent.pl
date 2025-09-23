@@ -512,6 +512,7 @@ $batch_server_command .= "set STARTTIME=%TIME: =0%" . "\r\n"
     . "set second=%ss:~1%\r\n"
     . "if exist SERVER_STOPPED exit\r\n"
     . "IF \"%hour%\" == \"00\" IF \"%minute%\" == \"00\" IF %second% lss 60 exit\r\n"
+	. "timeout /t 30 /nobreak >nul\r\n"
     . "goto TOP\r\n";
 	
 	print SERV_START_BAT_SCRIPT $batch_server_command;
@@ -1151,8 +1152,8 @@ sub stop_server_without_decrypt
     # Immediately kill the process
     logger "Immediately killing server process with PID $windows_pid.";
     system("cmd /C taskkill /f /fi 'PID eq $windows_pid' /T");
-    system('screen -wipe > /dev/null 2>&1');
-    logger "Server ID $home_id: Process killed.";
+    system("screen -wipe $screen_pid > /dev/null 2>&1");
+    logger "Server ID $screen_pid : $home_id Process killed.";
     
     return 0;
 }
