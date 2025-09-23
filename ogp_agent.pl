@@ -2433,30 +2433,31 @@ sub restart_server
 ## return 1 Restart OK
 sub restart_server_without_decrypt
 {
-	my ($home_id, $server_ip, $server_port, $control_protocol,
-		$control_password, $control_type, $home_path, $server_exe, $run_dir,
-		$cmd, $cpu, $nice, $preStart, $envVars, $game_key, $console_log) = @_;
+    my ($home_id, $server_ip, $server_port, $control_protocol,
+        $control_password, $control_type, $home_path, $server_exe, $run_dir,
+        $cmd, $cpu, $nice, $preStart, $envVars, $game_key, $console_log) = @_;
 
-	if (stop_server_without_decrypt($home_id, $server_ip, 
-									$server_port, $control_protocol,
-									$control_password, $control_type, $home_path) == 0)
-	{
-		if (universal_start_without_decrypt($home_id, $home_path, $server_exe, $run_dir,
-											$cmd, $server_port, $server_ip, $cpu, $nice, $preStart, $envVars, $game_key, $console_log) == 1)
-		{
-			return 1;
-		}
-		else
-		{
-			return -1;
-		}
-	}
-	else
-	{
-		return -2;
-	}
+    if (stop_server_without_decrypt($home_id, $server_ip, 
+                                    $server_port, $control_protocol,
+                                    $control_password, $control_type, $home_path) == 0)
+    {
+        logger "Waiting 60 seconds before starting the server again.";
+        sleep 60;
+        if (universal_start_without_decrypt($home_id, $home_path, $server_exe, $run_dir,
+                                            $cmd, $server_port, $server_ip, $cpu, $nice, $preStart, $envVars, $game_key, $console_log) == 1)
+        {
+            return 1;
+        }
+        else
+        {
+            return -1;
+        }
+    }
+    else
+    {
+        return -2;
+    }
 }
-
 sub sudo_exec
 {
 	return "Bad Encryption Key" unless(decrypt_param(pop(@_)) eq "Encryption checking OK");

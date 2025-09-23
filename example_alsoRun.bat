@@ -4,10 +4,11 @@
 # second apps but now that file can be reserved for other uses like log cleanup etc.
 
 @echo off
-cd /d "%~dp0bec"
+cd bec
 del /q "..\_alsoRun.pid" 2>nul
 start "BEC" bec.exe --dsc --dec -f config.cfg
-timeout /t 1 /nobreak >nul
+cd ..
+timeout /t 3 /nobreak >nul
 for /f "tokens=2 delims==" %%P in ('wmic process where "ExecutablePath='%cd:\=\\%\\bec.exe'" get ProcessId /value ^| find "="') do >"..\_alsoRun.pid" echo %%P
 
 
@@ -16,9 +17,10 @@ for /f "tokens=2 delims==" %%P in ('wmic process where "ExecutablePath='%cd:\=\\
 
 printf '%s\r\n' \
 '@echo off' \
-'cd /d "%~dp0bec"' \
+'cd bec \
 'del /q "..\_alsoRun.pid" 2>nul' \
 'start "BEC" bec.exe --dsc --dec -f config.cfg' \
-'timeout /t 1 /nobreak >nul' \
+' cd .. ' \
+'timeout /t 3 /nobreak >nul' \
 'for /f "tokens=2 delims==" %%P in ('"'"'wmic process where "ExecutablePath='"'"'%cd:\=\\%\\bec.exe'"'"'" get ProcessId /value ^| find "="'"'"') do >"..\_alsoRun.pid" echo %%P' \
 > _alsoRun.bat
