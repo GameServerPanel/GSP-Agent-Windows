@@ -49,4 +49,4 @@ The Windows agent bundles Cygwin, Perl, GNU Screen, and helper scripts so the Ga
 
 - Always run the installer as Administrator so it can write to `Program Files`, register services, and manage the `gameserver` account.
 - Keep the `team@worlddomination.dev` mailbox handy for provider login challenges when managing Windows hosts.
-- The Linux agent docs live in `GSP_Agent_Linux/documentation/agent-guide.md` and the panel XML reference is in `GSP/documentation/`.
+- The Linux agent docs live in `GSP-Agent-Linux/documentation/agent-guide.md` and the panel XML reference is in `GSP/documentation/`.
