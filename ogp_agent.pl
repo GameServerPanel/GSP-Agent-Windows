@@ -349,7 +349,8 @@ my $d = Frontier::Daemon::OGP::Forking->new(
 				 remote_query					=> \&remote_query,
 				 send_steam_guard_code  		=> \&send_steam_guard_code,
 				 steam_workshop					=> \&steam_workshop,
-				 get_workshop_mods_info			=> \&get_workshop_mods_info
+				 get_workshop_mods_info			=> \&get_workshop_mods_info,
+				 install_steam_workshop_item	=> \&install_steam_workshop_item
 			 },
 			 debug	 => 4,
 			 LocalPort => AGENT_PORT,
@@ -2360,6 +2361,9 @@ sub exec
 {
 	return "Bad Encryption Key" unless(decrypt_param(pop(@_)) eq "Encryption checking OK");
 	my ($command) = decrypt_params(@_);
+	# Ensure AGENT_RUN_DIR is in PATH so agent-local scripts (e.g.
+	# generic_steam_workshop_windows_cygwin.sh) are resolvable by name.
+	local $ENV{PATH} = AGENT_RUN_DIR . ":" . ($ENV{PATH} // '');
 	my @cmdret		   = `$command 2>/dev/null`;
 	my $encoded_content = encode_list(@cmdret);
 	return "1;$encoded_content";
@@ -4247,6 +4251,148 @@ sub get_workshop_mods_info()
 	}
 	
 	return -1;
+}
+
+#### Install a single Steam Workshop item ####
+### Inputs (all encrypted, in order):
+###   home_id, home_path, steamcmd_path, steam_app_id, workshop_app_id,
+###   workshop_id, target_path, folder_name, validate, copy_mode,
+###   post_install_command
+### @return  1  Install started successfully.
+### @return -1  Missing / invalid parameters or path setup failed.
+### @return -2  SteamCMD binary not found.
+sub install_steam_workshop_item
+{
+	chomp(@_);
+	return "Bad Encryption Key" unless(decrypt_param(pop(@_)) eq "Encryption checking OK");
+	return install_steam_workshop_item_without_decrypt(decrypt_params(@_));
+}
+
+sub install_steam_workshop_item_without_decrypt
+{
+	my ($home_id, $home_path, $steamcmd_path,
+		$steam_app_id, $workshop_app_id, $workshop_id,
+		$target_path, $folder_name, $validate,
+		$copy_mode, $post_install_command) = @_;
+
+	# Validate required inputs
+	if (!defined $home_id        || $home_id eq ''        ||
+		!defined $home_path      || $home_path eq ''      ||
+		!defined $workshop_app_id || $workshop_app_id eq '' ||
+		!defined $workshop_id    || $workshop_id eq '')
+	{
+		logger "install_steam_workshop_item: Missing required parameters";
+		return -1;
+	}
+
+	# Ensure home_path exists (create if necessary)
+	if (check_b4_chdir($home_path) != 0)
+	{
+		return -1;
+	}
+
+	# Resolve SteamCMD binary – prefer an explicitly supplied path, else
+	# fall back to the agent's bundled steamcmd.exe.
+	my $steam_binary;
+	if (defined $steamcmd_path && $steamcmd_path ne '' && -f $steamcmd_path)
+	{
+		$steam_binary = $steamcmd_path;
+	}
+	else
+	{
+		$steam_binary = STEAMCMD_CLIENT_BIN;
+	}
+
+	if (!-f $steam_binary)
+	{
+		logger "install_steam_workshop_item: SteamCMD not found at $steam_binary";
+		return -2;
+	}
+
+	# Change to steamcmd directory (required by steamcmd.exe on Windows)
+	if (check_b4_chdir(STEAMCMD_CLIENT_DIR) != 0)
+	{
+		return -1;
+	}
+
+	my $screen_id              = create_screen_id(SCREEN_TYPE_UPDATE, $home_id);
+	my $installSteamFile       = $screen_id . "_workshop_item.txt";
+	my $installtxt             = Path::Class::File->new(STEAMCMD_CLIENT_DIR, $installSteamFile);
+	my $windows_home_path      = clean(`cygpath -wa $home_path`);
+
+	open FILE, '>', $installtxt;
+	print FILE "\@ShutdownOnFailedCommand 1\n";
+	print FILE "\@NoPromptForPassword 1\n";
+	print FILE "login anonymous\n";
+	print FILE "force_install_dir \"$windows_home_path\"\n";
+	if (defined $validate && $validate eq '1')
+	{
+		print FILE "workshop_download_item $workshop_app_id $workshop_id validate\n";
+	}
+	else
+	{
+		print FILE "workshop_download_item $workshop_app_id $workshop_id\n";
+	}
+	print FILE "exit\n";
+	close FILE;
+
+	my $windows_installtxt = clean(`cygpath -wa $installtxt`);
+	$windows_installtxt =~ s/\\/\\\\/g;
+
+	my @installcmds = ("$steam_binary +runscript $windows_installtxt +exit");
+
+	# Default download location used by steamcmd workshop_download_item
+	my $steamcmd_dl_path = '/steamapps/workshop/content/' . $workshop_app_id . '/' . $workshop_id;
+	my $source_path      = $home_path . $steamcmd_dl_path;
+
+	# Resolve the target directory
+	if (!defined $target_path || $target_path eq '')
+	{
+		my $effective_folder = (defined $folder_name && $folder_name ne '')
+			? $folder_name
+			: '@' . $workshop_id;
+		$target_path = $home_path . '/' . $effective_folder;
+	}
+
+	# Build post-install script: copy workshop content to target_path
+	my $postcmd = '';
+	$copy_mode //= 'copy';
+	if ($copy_mode eq 'mirror')
+	{
+		$postcmd .= "rsync -a --delete \"$source_path/\" \"$target_path/\"\n";
+	}
+	elsif ($copy_mode eq 'symlink')
+	{
+		$postcmd .= "ln -sfn \"$source_path\" \"$target_path\"\n";
+	}
+	else
+	{
+		# Default: plain copy
+		$postcmd .= "mkdir -p \"$target_path\"\n";
+		$postcmd .= "cp -r \"$source_path/.\" \"$target_path/\"\n";
+	}
+
+	if (defined $post_install_command && $post_install_command ne '')
+	{
+		$postcmd .= "$post_install_command\n";
+	}
+
+	my $log_file = Path::Class::File->new(SCREEN_LOGS_DIR, "screenlog.$screen_id");
+	backup_home_log($home_id, $log_file);
+
+	my $bash_scripts_path = MANUAL_TMP_DIR . "/home_id_" . $home_id;
+	if (check_b4_chdir($bash_scripts_path) != 0)
+	{
+		return -1;
+	}
+
+	my $installfile = create_bash_scripts($home_path, $bash_scripts_path, '', $postcmd, @installcmds);
+	my $screen_cmd  = create_screen_cmd($screen_id, "./$installfile");
+
+	logger "Installing Steam Workshop item $workshop_id (app: $workshop_app_id) for home ID $home_id";
+	system($screen_cmd);
+
+	return 1;
 }
 
 sub get_setting_using_api
