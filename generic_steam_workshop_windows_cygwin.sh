@@ -53,12 +53,11 @@ def fail(message):
 
 
 def uniq_numeric_items(raw_items):
-    seen = []
-    for value in raw_items:
-        text = str(value).strip()
-        if text.isdigit() and text not in seen:
-            seen.append(text)
-    return seen
+    seen = dict.fromkeys(
+        text for value in raw_items
+        if (text := str(value).strip()).isdigit()
+    )
+    return list(seen)
 
 
 def render_template(template, values):
@@ -131,7 +130,6 @@ def sync_copy(src, dst):
         if os.path.isdir(source_entry):
             sync_copy(source_entry, target_entry)
         else:
-            os.makedirs(os.path.dirname(target_entry), exist_ok=True)
             shutil.copy2(source_entry, target_entry)
 
 
